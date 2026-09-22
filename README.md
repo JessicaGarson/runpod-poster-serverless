@@ -34,14 +34,20 @@ The default worker payload is:
 
 Set `RUNPOD_PROMPT_FIELD` if your handler uses a different prompt property. The adapter recognizes common output shapes: a URL string, `image`, `image_url`, `url`, or the first item in `images`.
 
-## Three-minute presenter flow
+## What the demo shows
 
-1. Start with the traffic shape: **quiet → crowd → quiet**. Ask what happens if capacity is sized for the quiet period—or for the crowd.
-2. Point out **0 workers**, ask the audience for a ridiculous prompt, and click **Print one**.
-3. Narrate the cold start. Nothing was sitting idle, so the first request has to wait for a GPU worker to become ready.
-4. Click **Send four jobs**. The important thing to watch is the queue and worker count: concurrency increases to absorb the burst.
-5. Once the queue clears, show the workers scaling down again.
-6. Compare **Scale to zero** with **Keep one warm**. This is a latency-versus-idle-capacity decision, not a universally correct setting.
-7. Close by connecting the mechanics to Runpod: the endpoint accepts jobs, manages the queue, and changes the number of GPU workers within the limits you configure.
+GPU workloads rarely arrive at a steady rate. This demo follows one simple traffic pattern—**quiet → crowd → quiet**—and makes the infrastructure response visible.
 
-For a real endpoint, configure `workersMax: 3`. Use `workersMin: 0` for the scale-to-zero story, or `workersMin: 1` when demonstrating the latency-versus-standing-cost tradeoff.
+1. The demo begins at **0 workers**, with no GPU capacity sitting idle.
+2. Enter a prompt and select **Make poster**. The first request waits while a GPU worker starts.
+3. Select **Send 4 at once** to create a burst. Watch the queue and worker count as more capacity comes online.
+4. When the queue clears, the additional workers scale down again.
+5. Switch between **Scale to zero** and **Keep one warm** to compare lower idle cost with lower startup latency.
+
+Runpod Serverless handles the request queue and adjusts the number of GPU workers within the limits configured for the endpoint. There is no universally correct minimum worker count—the useful setting depends on how much startup latency the application and its users can tolerate.
+
+> The default simulation is designed to explain the lifecycle clearly and consistently. It is not a performance benchmark. Connect a live endpoint to observe timings from a real workload.
+
+## Suggested endpoint settings
+
+Set `workersMax: 3` to make concurrent scaling visible during the burst. Use `workersMin: 0` to demonstrate scaling to zero, or `workersMin: 1` to keep one worker ready between requests.
