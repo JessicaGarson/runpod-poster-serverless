@@ -4,14 +4,35 @@
 
 This interactive demo shows what happens when a quiet GPU workload suddenly gets busy. Make a poster from your own prompt, then send four requests at once to watch [Runpod Serverless](https://docs.runpod.io/serverless/overview) bring workers online and work through the queue. When the jobs are done, the workers can scale back down.
 
-The posters use real generated images, and the worker counts and job times come from the live endpoint. There is no simulation mode.
+Every poster is a real GPU job. The page shows the live queue, worker activity, and how long each job waited and ran. There is no simulation mode.
 
-## Run it yourself
+## What happens when you press the button
 
-You'll need Node.js 20 or later, a Runpod account, and a Runpod API key.
+With no requests, the endpoint can sit at zero workers. Your first prompt enters the queue while Runpod starts a GPU worker and loads the image model. **Send 4 at once** adds a burst: more workers can start, take jobs from the same queue, and then wind down after it clears. The first request may take a couple of minutes; actual times depend on your endpoint and GPU availability.
 
-1. **Create a Serverless endpoint** using the [`worker-vllm-omni` worker](https://github.com/runpod-workers/worker-vllm-omni). Set `MODEL_NAME=Tongyi-MAI/Z-Image-Turbo` and choose a GPU with at least 32 GB of VRAM. To see the full scale-up and scale-down story, set minimum workers to **0**, maximum workers to **3**, and a short idle timeout.
-2. **Configure the app.** Copy `.env.example` to `.env.local`, then add your API key and endpoint ID:
+The generated image becomes a subtle layer in a poster designed with CSS, so the gallery has a consistent look while each image is made by the model.
+
+## Set up the Runpod backend
+
+You'll need a Runpod account and API key. Create a [Serverless endpoint](https://docs.runpod.io/serverless/overview) using the [`worker-vllm-omni` worker](https://github.com/runpod-workers/worker-vllm-omni), which serves [Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) for this demo.
+
+Configure the endpoint with:
+
+| Setting | Value for this demo | Why |
+| --- | --- | --- |
+| Worker environment variable | `MODEL_NAME=Tongyi-MAI/Z-Image-Turbo` | Loads the image model |
+| GPU | At least 32 GB VRAM | Provides room for the model |
+| Minimum workers | `0` | Lets the endpoint scale to zero |
+| Maximum workers | `3` | Lets a burst spread across workers |
+| Idle timeout | Short | Makes the scale-down visible after jobs finish |
+
+Runpod bills for the GPU capacity your endpoint uses. A longer idle timeout keeps workers ready for the next request, while a shorter one makes a cold start more likely.
+
+## Run the app
+
+You'll also need Node.js 20 or later.
+
+1. Copy `.env.example` to `.env.local` and add the API key and ID of the endpoint you created:
 
    ```bash
    cp .env.example .env.local
@@ -22,21 +43,21 @@ You'll need Node.js 20 or later, a Runpod account, and a Runpod API key.
    RUNPOD_ENDPOINT_ID=your-endpoint-id
    ```
 
-   The example file also includes optional model and image-size settings. Keep your API key in `.env.local`; the app sends it to Runpod from the server.
+   The example file includes optional `RUNPOD_MODEL` and `RUNPOD_IMAGE_SIZE` settings. Their defaults match the endpoint configuration above. Keep your API key in `.env.local`.
 
-3. **Start the app.**
+2. Install dependencies and start the app:
 
    ```bash
    npm install
    npm run dev
    ```
 
-Open [http://localhost:3000](http://localhost:3000). Enter a prompt and select **Make poster**, or select **Send 4 at once** to see a burst. The controls require both Runpod settings above.
+3. Open [http://localhost:3000](http://localhost:3000). Enter a prompt and select **Make poster**, or select **Send 4 at once** to see a burst. The controls stay disabled until the API key and endpoint ID are configured.
 
-## What you'll see
+## How the pieces connect
 
-- **Workers starting, running, and winding down** as demand changes.
-- **A live queue** when requests arrive faster than workers can take them.
-- **Wait and run times** on each finished poster, so you can see where the time went.
+```text
+Browser → Next.js app → Runpod job queue → GPU worker → generated image
+```
 
-The generated image appears as a subtle layer in each poster's design. A first request to an idle endpoint can take a couple of minutes while its worker starts and loads the model; later requests may be faster while workers are still warm. Actual times depend on your endpoint and GPU availability.
+The Next.js backend keeps the API key off the browser. It submits jobs to Runpod, checks their status until images are ready, and reads endpoint health to display queue and worker counts. The app's **Warm up 3 GPUs** control sends real jobs ahead of a presentation if you want workers ready before the first audience request.
