@@ -1,9 +1,8 @@
 "use client";
 
-import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, useEffect, useMemo, useState } from "react";
 
 type Phase = "queued" | "starting" | "generating" | "complete" | "failed";
-type Mode = "simulation" | "live";
 
 type PosterJob = {
   id: string;
@@ -13,7 +12,27 @@ type PosterJob = {
   startedAt: number;
   completedAt?: number;
   image?: string | null;
+  error?: string;
+  delayMs?: number | null;
+  executionMs?: number | null;
   accent: number;
+};
+
+type Health = {
+  workers: { idle?: number; initializing?: number; running?: number; throttled?: number };
+  jobs: { inQueue?: number; inProgress?: number };
+};
+
+type WorkerState = "running" | "starting" | "warm" | "off";
+
+// Matches the endpoint's workersMax; see README.
+const MAX_WORKERS = 3;
+
+const workerLabel: Record<WorkerState, string> = {
+  running: "Running",
+  starting: "Starting",
+  warm: "Idle",
+  off: "Off",
 };
 
 const STYLES = ["Neon editorial", "Retro risograph", "Cosmic minimal", "Brick built"];
@@ -32,13 +51,41 @@ const BURST_PROMPTS = [
 
 const phaseLabel: Record<Phase, string> = {
   queued: "Queued",
-  starting: "Cold start",
+  starting: "Starting",
   generating: "Generating",
   complete: "Printed",
   failed: "Failed",
 };
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const seconds = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
+
+type JobResult = { status: string; image?: string | null; delayTime?: number | null; executionTime?: number | null; error?: string | null };
+
+async function submitJob(prompt: string, style: string): Promise<{ id: string }> {
+  const response = await fetch("/api/runpod", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prompt, style }),
+  });
+  const submitted = await response.json();
+  if (!response.ok || !submitted.id) throw new Error(submitted.error || "Could not submit job");
+  return submitted;
+}
+
+async function waitForJob(id: string, onInProgress?: () => void): Promise<JobResult> {
+  // A true cold start on this endpoint takes about 2.5 minutes, so allow up to five.
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    await wait(1500);
+    const response = await fetch(`/api/runpod?id=${encodeURIComponent(id)}`);
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || "Could not read Runpod job status");
+    if (result.status === "IN_PROGRESS") onInProgress?.();
+    if (result.status === "COMPLETED") return result;
+    if (["FAILED", "CANCELLED", "TIMED_OUT"].includes(result.status)) throw new Error(result.error || result.status);
+  }
+  throw new Error("Job polling timed out");
+}
 
 function styleKey(style: string) {
   if (style.startsWith("Retro")) return "riso";
@@ -47,32 +94,35 @@ function styleKey(style: string) {
   return "neon";
 }
 
-function Poster({ job, index }: { job: PosterJob; index: number }) {
+function Poster({ job, index, now }: { job: PosterJob; index: number; now: number }) {
   return (
     <article className={`poster poster-${job.accent % 4} style-${styleKey(job.style)} ${job.phase === "complete" ? "is-done" : ""}`}>
-      {job.image ? (
-        // The endpoint may return a remote URL or data URL; a regular img supports both.
+      {job.image && (
+        // The generated image is intentionally a faint texture beneath the CSS poster.
         // eslint-disable-next-line @next/next/no-img-element
-        <img className="poster-image" src={job.image} alt={job.prompt} />
-      ) : (
-        <>
-          <div className="poster-orbit" />
-          <div className="poster-grain" />
-          <div className="poster-bricks" aria-hidden="true">
-            <i /><i /><i /><i /><i />
-          </div>
-          <span className="poster-number">0{index + 1}</span>
-          <div className="poster-copy">
-            <span>{job.style}</span>
-            <h3>{job.prompt}</h3>
-          </div>
-          <span className="poster-foot">PROMPT PARADE · RUNPOD</span>
-        </>
+        <img className="poster-image-trace" src={job.image} alt="" aria-hidden="true" />
       )}
+      <div className="poster-orbit" />
+      <div className="poster-grain" />
+      <div className="poster-bricks" aria-hidden="true">
+        <i /><i /><i /><i /><i />
+      </div>
+      <span className="poster-number">0{index + 1}</span>
+      <div className="poster-copy">
+        <span>{job.style}</span>
+        <h3>{job.prompt}</h3>
+      </div>
+      <span className="poster-foot">
+        {job.phase === "complete" && job.delayMs != null && job.executionMs != null
+          ? `Waited ${seconds(job.delayMs)} · Ran ${seconds(job.executionMs)}`
+          : "Made on Runpod"}
+      </span>
       {job.phase !== "complete" && (
-        <div className="poster-process">
-          <span className="spinner" />
-          {phaseLabel[job.phase]}
+        <div className={`poster-process ${job.phase === "failed" ? "is-failed" : ""}`} title={job.error}>
+          {job.phase !== "failed" && <span className="spinner" />}
+          <span>{phaseLabel[job.phase]}</span>
+          {job.phase !== "failed" && <span className="poster-elapsed">{seconds(Math.max(0, now - job.startedAt))}</span>}
+          {job.error && <small>{job.error}</small>}
         </div>
       )}
     </article>
@@ -83,38 +133,77 @@ export default function Home() {
   const [prompt, setPrompt] = useState("A raccoon DJ performing on Mars");
   const [style, setStyle] = useState(STYLES[0]);
   const [jobs, setJobs] = useState<PosterJob[]>([]);
-  const [workersMin, setWorkersMin] = useState<0 | 1>(0);
-  const [mode, setMode] = useState<Mode>("simulation");
-  const [liveAvailable, setLiveAvailable] = useState(false);
-  const timers = useRef<number[]>([]);
+  const [liveAvailable, setLiveAvailable] = useState<boolean | null>(null);
+  const [health, setHealth] = useState<Health | null>(null);
+  const [now, setNow] = useState(() => Date.now());
+  const [warmup, setWarmup] = useState<{ ready: number; failed: number } | null>(null);
 
   useEffect(() => {
     fetch("/api/runpod")
       .then((response) => response.json())
       .then((data) => setLiveAvailable(Boolean(data.liveAvailable)))
       .catch(() => setLiveAvailable(false));
-    return () => timers.current.forEach(window.clearTimeout);
   }, []);
 
+  // Poll endpoint health the whole time, so the audience can watch workers scale back down after the burst.
+  useEffect(() => {
+    if (liveAvailable !== true) return;
+    let cancelled = false;
+    async function poll() {
+      try {
+        const response = await fetch("/api/runpod?health=1");
+        if (response.ok && !cancelled) setHealth(await response.json());
+      } catch {
+        // Keep the last reading; the inferred worker view below covers gaps.
+      }
+    }
+    void poll();
+    const timer = window.setInterval(poll, 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [liveAvailable]);
+
   const activeJobs = jobs.filter((job) => !["complete", "failed"].includes(job.phase));
-  const queued = jobs.filter((job) => job.phase === "queued").length;
+  const hasActiveJobs = activeJobs.length > 0;
+
+  // Tick elapsed timers so a cold start reads as time passing rather than a frozen screen.
+  useEffect(() => {
+    if (!hasActiveJobs) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 250);
+    return () => window.clearInterval(timer);
+  }, [hasActiveJobs]);
+
+  const queued = health?.jobs.inQueue ?? jobs.filter((job) => job.phase === "queued" || job.phase === "starting").length;
   const starting = jobs.some((job) => job.phase === "starting");
   const generating = jobs.some((job) => job.phase === "generating");
-  const activeWorkers = Math.max(workersMin, Math.min(3, activeJobs.length - queued));
+  const running = health?.workers.running ?? Math.min(MAX_WORKERS, jobs.filter((job) => job.phase === "generating").length);
+  const initializing = health?.workers.initializing ?? 0;
+  const warm = health?.workers.idle ?? 0;
+  const throttled = health?.workers.throttled ?? 0;
+  const workerStates: WorkerState[] = Array.from({ length: MAX_WORKERS }, (_, slot) => {
+    if (slot < running) return "running";
+    if (slot < running + initializing) return "starting";
+    if (slot < running + initializing + warm) return "warm";
+    return "off";
+  });
   const latestCompleted = [...jobs].reverse().find((job) => job.phase === "complete");
   const lastDuration = latestCompleted?.completedAt
     ? ((latestCompleted.completedAt - latestCompleted.startedAt) / 1000).toFixed(1)
     : "—";
+  const oldestStarting = jobs.find((job) => job.phase === "starting");
+  const startingFor = oldestStarting ? Math.round((now - oldestStarting.startedAt) / 1000) : 0;
 
   const story = useMemo(() => {
-    if (starting) return { eyebrow: "COLD START", title: "No worker was ready, so a GPU is starting.", note: "This startup time is the latency tradeoff of scaling all the way to zero." };
-    if (activeJobs.length > 1) return { eyebrow: "BURST TRAFFIC", title: "More jobs arrive than one worker can handle.", note: `Runpod can add up to ${Math.min(3, activeJobs.length)} GPU workers to process the queue in parallel.` };
+    if (starting && activeJobs.length > 1) return { eyebrow: "BURST TRAFFIC", title: "More jobs arrived than one worker can handle.", note: throttled > 0 && initializing === 0 ? "Jobs are queued while Runpod waits for free GPUs in this endpoint's pool." : `Runpod is starting more workers, up to ${MAX_WORKERS}, to work through the queue in parallel.` };
+    if (starting) return { eyebrow: `STARTING · ${startingFor}s`, title: running > 0 ? "A running worker is picking up the job." : "No GPU was running, so Runpod is starting one.", note: "This wait is the cost of scaling to zero: nothing was billing while idle, so the first request pays the startup time." };
+    if (activeJobs.length > 1) return { eyebrow: "BURST TRAFFIC", title: "Several GPU workers are running at once.", note: "Each worker takes a job from the same queue. No load balancer to configure." };
     if (activeJobs.length === 1) return { eyebrow: "ONE ACTIVE JOB", title: "A GPU worker is running the model.", note: "When the queue clears, this worker can be removed instead of sitting idle." };
-    if (jobs.length > 0 && workersMin === 1) return { eyebrow: "QUEUE CLEAR", title: "The poster is done. One worker stays warm.", note: "The next request starts faster, but idle capacity still has a cost." };
-    if (jobs.length > 0) return { eyebrow: "QUEUE CLEAR", title: "The poster is done. The worker scales down.", note: "No warm workers means no active GPU compute while idle." };
-    if (workersMin === 1) return { eyebrow: "WARM WORKER", title: "One GPU is ready before the first request.", note: "That reduces startup latency in exchange for paying for idle capacity." };
-    return { eyebrow: "IDLE", title: "No requests. No GPU workers running.", note: "Submit a prompt to see what happens from an empty queue." };
-  }, [activeJobs.length, jobs.length, starting, workersMin]);
+    if (jobs.length > 0 && warm > 0) return { eyebrow: "QUEUE CLEAR", title: "Queue clear. Workers are winding down.", note: "Workers stay up for the endpoint's idle timeout, then scale down to zero. That timeout is the dial between startup latency and idle cost." };
+    if (jobs.length > 0) return { eyebrow: "SCALED TO ZERO", title: "Queue clear. No GPUs running.", note: "Nothing is billing until the next request arrives." };
+    return { eyebrow: "IDLE", title: "No requests in the queue.", note: "Submit a prompt to send a real job to the Runpod Serverless endpoint." };
+  }, [activeJobs.length, initializing, jobs.length, running, starting, startingFor, throttled, warm]);
 
   const lifecycleStep = starting
     ? "starting"
@@ -130,60 +219,43 @@ export default function Home() {
     setJobs((current) => current.map((job) => (job.id === id ? { ...job, ...patch } : job)));
   }
 
-  function schedule(id: string, phase: Phase, delay: number, extra: Partial<PosterJob> = {}) {
-    timers.current.push(window.setTimeout(() => patchJob(id, { phase, ...extra }), delay));
-  }
-
-  async function runLive(job: PosterJob) {
+  async function runOnRunpod(job: PosterJob) {
     try {
       patchJob(job.id, { phase: "queued" });
-      const submit = await fetch("/api/runpod", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: job.prompt, style: job.style }),
-      });
-      const submitted = await submit.json();
-      if (!submit.ok || !submitted.id) throw new Error(submitted.error || "Could not submit job");
+      const submitted = await submitJob(job.prompt, job.style);
 
-      patchJob(job.id, { phase: workersMin === 0 ? "starting" : "generating" });
-      for (let attempt = 0; attempt < 120; attempt += 1) {
-        await wait(1500);
-        const response = await fetch(`/api/runpod?id=${encodeURIComponent(submitted.id)}`);
-        const result = await response.json();
-        if (result.status === "IN_PROGRESS") patchJob(job.id, { phase: "generating" });
-        if (result.status === "COMPLETED") {
-          patchJob(job.id, { phase: "complete", image: result.image, completedAt: Date.now() });
-          return;
-        }
-        if (["FAILED", "CANCELLED", "TIMED_OUT"].includes(result.status)) throw new Error(result.error || result.status);
-      }
-      throw new Error("Job polling timed out");
-    } catch {
-      patchJob(job.id, { phase: "failed", completedAt: Date.now() });
+      patchJob(job.id, { phase: "starting" });
+      const result = await waitForJob(submitted.id, () => patchJob(job.id, { phase: "generating" }));
+      if (!result.image) throw new Error("Runpod completed without returning an image");
+      patchJob(job.id, {
+        phase: "complete",
+        image: result.image,
+        completedAt: Date.now(),
+        delayMs: result.delayTime,
+        executionMs: result.executionTime,
+      });
+    } catch (error) {
+      patchJob(job.id, {
+        phase: "failed",
+        completedAt: Date.now(),
+        error: error instanceof Error ? error.message : "Runpod job failed",
+      });
     }
   }
 
-  function launch(nextPrompt: string, nextStyle: string, offset = 0) {
+  function launch(nextPrompt: string, nextStyle: string, accentOffset = 0) {
+    if (liveAvailable !== true) return;
     const id = crypto.randomUUID();
     const job: PosterJob = {
       id,
       prompt: nextPrompt,
       style: nextStyle,
       phase: "queued",
-      startedAt: Date.now() + offset,
-      accent: jobs.length + Math.round(offset / 100),
+      startedAt: Date.now(),
+      accent: jobs.length + accentOffset,
     };
-    timers.current.push(window.setTimeout(() => {
-      setJobs((current) => [...current, job]);
-      if (mode === "live") {
-        void runLive(job);
-        return;
-      }
-      const coldDelay = workersMin === 0 && jobs.length === 0 ? 1800 : 350;
-      schedule(id, workersMin === 0 && jobs.length === 0 ? "starting" : "generating", 250);
-      schedule(id, "generating", coldDelay);
-      schedule(id, "complete", coldDelay + 3000 + (offset % 3) * 230, { completedAt: Date.now() + coldDelay + 3000 });
-    }, offset));
+    setJobs((current) => [...current, job]);
+    void runOnRunpod(job);
   }
 
   function handleSubmit(event: FormEvent) {
@@ -200,14 +272,31 @@ export default function Home() {
       .filter((item) => !promptsAlreadyShown.has(item.toLowerCase()))
       .slice(0, 4);
 
-    burst.forEach((item, index) => launch(item, STYLES[index % STYLES.length], index * 180));
+    burst.forEach((item, index) => launch(item, STYLES[index % STYLES.length], index));
   }
 
   function reset() {
-    timers.current.forEach(window.clearTimeout);
-    timers.current = [];
     setJobs([]);
   }
+
+  // Presenter-only: start every worker before the talk so on-stage posters skip the cold start.
+  // Warm-up jobs never enter the gallery.
+  function warmUp() {
+    setWarmup({ ready: 0, failed: 0 });
+    for (let worker = 0; worker < MAX_WORKERS; worker += 1) {
+      submitJob(`Warm-up ${worker + 1}: a simple geometric shape`, STYLES[0])
+        .then((submitted) => waitForJob(submitted.id))
+        .then(() => setWarmup((current) => current && { ...current, ready: current.ready + 1 }))
+        .catch(() => setWarmup((current) => current && { ...current, failed: current.failed + 1 }));
+    }
+  }
+
+  const warmupDone = warmup !== null && warmup.ready + warmup.failed === MAX_WORKERS;
+  const warmupLabel = warmup === null
+    ? `Warm up ${MAX_WORKERS} GPUs`
+    : warmupDone
+      ? warmup.failed > 0 ? `Warm-up: ${warmup.failed} failed` : `${MAX_WORKERS} GPUs warm ✓`
+      : `Warming… ${warmup.ready}/${MAX_WORKERS}`;
 
   return (
     <main>
@@ -246,9 +335,12 @@ export default function Home() {
         <form className={`prompt-form style-ui-${styleKey(style)}`} onSubmit={handleSubmit}>
           <label htmlFor="prompt">What should we make?</label>
           <div className="prompt-row">
-            <input id="prompt" value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="An impossible meetup poster…" />
-            <button className="primary" type="submit">Make poster</button>
+            <input id="prompt" value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="An impossible meetup poster…" disabled={liveAvailable !== true} />
+            <button className="primary" type="submit" disabled={liveAvailable !== true}>
+              {liveAvailable === null ? "Checking Runpod…" : liveAvailable ? "Make poster" : "Runpod required"}
+            </button>
           </div>
+          {liveAvailable === false && <p className="runpod-required">Add <code>RUNPOD_API_KEY</code> and <code>RUNPOD_ENDPOINT_ID</code> to <code>.env.local</code>, then restart the app.</p>}
           <div className="style-row">
             {STYLES.map((item) => (
               <button type="button" key={item} aria-pressed={style === item} className={`${styleKey(item)} ${style === item ? "selected" : ""}`} onClick={() => setStyle(item)}>
@@ -260,7 +352,7 @@ export default function Home() {
         </form>
         <div className="burst-card">
           <div><span className="burst-icon">4</span><div><strong>Now add a crowd</strong><small>See what happens when requests arrive together</small></div></div>
-          <button onClick={runBurst}>Send 4 at once</button>
+          <button onClick={runBurst} disabled={liveAvailable !== true}>Send 4 at once</button>
         </div>
       </section>
 
@@ -284,37 +376,30 @@ export default function Home() {
           </div>
           <div className="metric-strip">
             <div><strong>{queued}</strong><small>Queued</small></div>
-            <div><strong>{activeWorkers}</strong><small>Workers</small></div>
+            <div><strong>{running}</strong><small>Running</small></div>
             <div><strong>{lastDuration}{lastDuration !== "—" && "s"}</strong><small>Last job</small></div>
           </div>
-          <div className="workers" aria-label={`${activeWorkers} of 3 workers active`}>
-            {[0, 1, 2].map((worker) => <span key={worker} className={worker < activeWorkers ? "active" : ""}><i />GPU WORKER {worker + 1}</span>)}
+          <div className="workers" aria-label={`${running} of ${MAX_WORKERS} workers running`}>
+            {workerStates.map((state, worker) => (
+              <span key={worker} className={`worker-${state}`}><i />GPU WORKER {worker + 1}<em>{workerLabel[state]}</em></span>
+            ))}
           </div>
+          <small className="health-source">{health ? "Live from the Runpod endpoint health API" : "Estimated from job status"}</small>
         </div>
 
         <div className="gallery">
           {jobs.length === 0 ? (
             <div className="empty-gallery">
               <div className="empty-art"><span>0</span><small>workers</small></div>
-              <p>Your first poster lands here.</p>
+              <p>Your first CSS poster lands here after Runpod completes the job.</p>
             </div>
-          ) : jobs.slice(-6).map((job, index) => <Poster key={job.id} job={job} index={index} />)}
+          ) : jobs.slice(-6).map((job, index) => <Poster key={job.id} job={job} index={index} now={now} />)}
         </div>
-      </section>
-
-      <section className="tradeoff">
-        <div><span className="overline">When the queue is empty</span><h2>Scale down, or keep one ready?</h2></div>
-        <div className="mode-switch">
-          <button className={workersMin === 0 ? "active" : ""} onClick={() => setWorkersMin(0)}><span>Scale to zero</span><small>0 warm workers · cold starts possible</small></button>
-          <button className={workersMin === 1 ? "active" : ""} onClick={() => setWorkersMin(1)}><span>Keep one warm</span><small>1 warm worker · lower startup latency</small></button>
-        </div>
-        <div className="cost-line"><span>While nothing is happening</span><strong>{workersMin === 0 ? "No active GPU workers" : "1 GPU worker stays active"}</strong></div>
       </section>
 
       <footer>
-        <p><strong>There isn&apos;t one right setting.</strong> <span>It depends on how long people can wait.</span></p>
         <div className="footer-actions">
-          {liveAvailable && <button onClick={() => { reset(); setMode(mode === "live" ? "simulation" : "live"); }}>{mode === "live" ? "Use simulation" : "Use live endpoint"}</button>}
+          <button onClick={warmUp} disabled={liveAvailable !== true || (warmup !== null && !warmupDone)}>{warmupLabel}</button>
           {jobs.length > 0 && <button onClick={reset}>Reset demo</button>}
         </div>
       </footer>

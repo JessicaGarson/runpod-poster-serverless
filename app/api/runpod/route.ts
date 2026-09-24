@@ -16,11 +16,16 @@ function extractImage(output: unknown): string | null {
   if (!output || typeof output !== "object") return null;
 
   const record = output as Record<string, unknown>;
+  if (typeof record.b64_json === "string") {
+    return `data:image/png;base64,${record.b64_json}`;
+  }
   for (const key of ["image", "image_url", "url"]) {
     if (typeof record[key] === "string") return record[key] as string;
   }
-  if (Array.isArray(record.images) && typeof record.images[0] === "string") {
-    return record.images[0];
+  for (const key of ["data", "images"]) {
+    if (Array.isArray(record[key]) && record[key].length > 0) {
+      return extractImage(record[key][0]);
+    }
   }
   return null;
 }
@@ -28,12 +33,24 @@ function extractImage(output: unknown): string | null {
 export async function GET(request: NextRequest) {
   const { apiKey, endpointId } = credentials();
   const id = request.nextUrl.searchParams.get("id");
+  const wantsHealth = request.nextUrl.searchParams.has("health");
 
-  if (!id) {
+  if (!id && !wantsHealth) {
     return NextResponse.json({ liveAvailable: Boolean(apiKey && endpointId) });
   }
   if (!apiKey || !endpointId) {
     return NextResponse.json({ error: "Live Runpod credentials are not configured." }, { status: 503 });
+  }
+
+  if (!id) {
+    // Real worker and queue counts, so the stage view reflects the endpoint rather than a guess.
+    const response = await fetch(`${API_ROOT}/${endpointId}/health`, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      cache: "no-store",
+    });
+    const data = await response.json();
+    if (!response.ok) return NextResponse.json(data, { status: response.status });
+    return NextResponse.json({ workers: data.workers ?? {}, jobs: data.jobs ?? {} });
   }
 
   const response = await fetch(`${API_ROOT}/${endpointId}/status/${encodeURIComponent(id)}`, {
@@ -64,7 +81,6 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "A prompt is required." }, { status: 400 });
   }
 
-  const promptField = process.env.RUNPOD_PROMPT_FIELD || "prompt";
   const subject = body.prompt.trim();
   const visualStyle = body.style || "Bold editorial poster";
   const styleDirection = visualStyle === "Brick built"
@@ -78,11 +94,17 @@ export async function POST(request: NextRequest) {
     },
     body: JSON.stringify({
       input: {
-        [promptField]: [
-          `Create an image of exactly this subject: ${subject}.`,
-          `Use ${styleDirection}.`,
-          "Keep the requested subject as the clear focus. Do not substitute a different character, object, or setting.",
-        ].join(" "),
+        openai_route: "/v1/images/generations",
+        openai_input: {
+          model: process.env.RUNPOD_MODEL || "Tongyi-MAI/Z-Image-Turbo",
+          prompt: [
+            `Create an image of exactly this subject: ${subject}.`,
+            `Use ${styleDirection}.`,
+            "Keep the requested subject as the clear focus. Do not substitute a different character, object, or setting.",
+          ].join(" "),
+          size: process.env.RUNPOD_IMAGE_SIZE || "512x512",
+          n: 1,
+        },
       },
     }),
   });

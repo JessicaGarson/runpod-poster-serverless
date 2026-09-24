@@ -1,53 +1,102 @@
-# Prompt Parade
+# Poster demo
 
-A meetup-ready, three-minute demonstration of a common GPU infrastructure problem: traffic is bursty, accelerators are costly while idle, and scaling to zero introduces startup latency. The audience invents a poster, watches a worker start from zero, then triggers a burst of jobs and sees the queue fan out across more workers.
+**Most of the time, nothing happens. Then everyone shows up.**
 
-## Run locally
+GPU traffic is spiky. Keep a GPU running all the time and you pay for it while it sits idle. Scale to zero and the first request after a quiet period waits for a GPU to start. This demo makes that tradeoff visible with a poster generator running on [Runpod Serverless](https://docs.runpod.io/serverless/overview).
+
+Type a prompt, and a real GPU job generates your poster. Then send four at once and watch Runpod spread the queue across several GPU workers, then scale them back down when it's empty.
+
+## What you'll see
+
+- **A live worker panel.** Each GPU worker shows as running, starting, idle, or off. The counts come from the endpoint's `/health` API every 2 seconds.
+- **A story card** that explains each stage as it happens: idle, cold start, burst, and scaling back down.
+- **Real timings on every poster.** The footer shows how long the job **waited** (queue plus worker startup) and how long the model **ran**, as reported by Runpod.
+- **A burst button.** "Send 4 at once" queues four jobs together, so you can watch more workers come online.
+
+Every poster is a real Runpod job. There's no simulated mode.
+
+## What we learned
+
+Measured on this demo's endpoint (Z-Image-Turbo, 512×512, 48GB GPUs, September 2026):
+
+| | Time |
+| --- | --- |
+| Cold start (worker starts and loads the model) | about 2–2½ minutes |
+| Generating one image | about 13–20 seconds |
+| Burst of 4 jobs, 3 workers max | 3 workers running within seconds, all 4 done in about 2½ minutes |
+
+Startup, not inference, is the expensive part. That's what the endpoint's scaling settings trade off:
+
+- **Minimum workers** keeps GPUs running at all times. There are no cold starts, but you pay around the clock.
+- **Idle timeout** keeps workers up for a while after their last job. A short timeout costs little while idle; a long one lets the next request start fast.
+- **Maximum workers** caps how far a burst can fan out.
+
+There's no universally right setting. It depends on how long your users can wait.
+
+## How it works
+
+```
+Browser ──▶ Next.js API route ──▶ Runpod queue ──▶ GPU worker ──▶ image
+             (holds the API key)    POST /run       vLLM-Omni
+                                    GET /status      Z-Image-Turbo
+                                    GET /health
+```
+
+- `app/page.tsx` is the whole UI: prompt form, burst button, worker panel, and gallery.
+- `app/api/runpod/route.ts` is a small server-side proxy. It submits jobs with `POST /run`, polls `GET /status/{id}`, and reads worker counts from `GET /health`. The API key never reaches the browser.
+- The GPU side is the [`worker-vllm-omni`](https://github.com/runpod-workers/worker-vllm-omni) worker serving [Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) through an OpenAI-style images API.
+
+Each job sends this payload:
+
+```json
+{
+  "input": {
+    "openai_route": "/v1/images/generations",
+    "openai_input": {
+      "model": "Tongyi-MAI/Z-Image-Turbo",
+      "prompt": "Create an image of exactly this subject: … Use a Neon editorial visual style. …",
+      "size": "512x512",
+      "n": 1
+    }
+  }
+}
+```
+
+The posters are CSS designs. The generated image is blended in underneath as a faint texture, so every poster keeps the same look while still proving the GPU did the work.
+
+## Run it yourself
+
+You'll need a Runpod account and Node.js 20 or later.
+
+**1. Deploy the worker.** Create a Serverless endpoint from [`runpod-workers/worker-vllm-omni`](https://github.com/runpod-workers/worker-vllm-omni) with:
+
+- Environment variable `MODEL_NAME=Tongyi-MAI/Z-Image-Turbo`
+- A GPU with at least 32GB of VRAM (the model peaks around 24GB)
+- **Max workers: 3**, so the burst has room to fan out
+- **Min workers: 0** and a short idle timeout, so you can see it scale to zero
+
+**2. Configure the app.** Copy `.env.example` to `.env.local` and fill in:
+
+```env
+RUNPOD_API_KEY=your-api-key
+RUNPOD_ENDPOINT_ID=your-endpoint-id
+
+# Optional
+RUNPOD_MODEL=Tongyi-MAI/Z-Image-Turbo
+RUNPOD_IMAGE_SIZE=512x512
+```
+
+An API key restricted to this endpoint is enough. The app only runs jobs and reads status.
+
+**3. Start it.**
 
 ```bash
 npm install
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000). The app starts in a deterministic simulation mode, so the complete talk works without credentials or venue Wi-Fi.
+Open [http://localhost:3000](http://localhost:3000). The controls stay disabled until the app can see both environment variables. The first poster pays the full cold start, so expect a couple of minutes' wait.
 
-## Connect a Runpod Serverless endpoint
+## Presenting it live
 
-Copy `.env.example` to `.env.local` and provide:
-
-```env
-RUNPOD_API_KEY=...
-RUNPOD_ENDPOINT_ID=...
-```
-
-The server-side adapter submits asynchronous jobs to `POST /run` and polls `GET /status/{id}`. Once configured, a **Use live endpoint** control appears in the footer. The API key is never sent to the browser.
-
-The default worker payload is:
-
-```json
-{
-  "input": {
-    "prompt": "Audience prompt. Selected visual style"
-  }
-}
-```
-
-Set `RUNPOD_PROMPT_FIELD` if your handler uses a different prompt property. The adapter recognizes common output shapes: a URL string, `image`, `image_url`, `url`, or the first item in `images`.
-
-## What the demo shows
-
-GPU workloads rarely arrive at a steady rate. This demo follows one simple traffic pattern—**quiet → crowd → quiet**—and makes the infrastructure response visible.
-
-1. The demo begins at **0 workers**, with no GPU capacity sitting idle.
-2. Enter a prompt and select **Make poster**. The first request waits while a GPU worker starts.
-3. Select **Send 4 at once** to create a burst. Watch the queue and worker count as more capacity comes online.
-4. When the queue clears, the additional workers scale down again.
-5. Switch between **Scale to zero** and **Keep one warm** to compare lower idle cost with lower startup latency.
-
-Runpod Serverless handles the request queue and adjusts the number of GPU workers within the limits configured for the endpoint. There is no universally correct minimum worker count—the useful setting depends on how much startup latency the application and its users can tolerate.
-
-> The default simulation is designed to explain the lifecycle clearly and consistently. It is not a performance benchmark. Connect a live endpoint to observe timings from a real workload.
-
-## Suggested endpoint settings
-
-Set `workersMax: 3` to make concurrent scaling visible during the burst. Use `workersMin: 0` to demonstrate scaling to zero, or `workersMin: 1` to keep one worker ready between requests.
+Start the first poster early if your talk is timed: a cold worker can take a couple of minutes to become ready. Use the warm-up control before presenting if you want the live jobs to begin on already running workers.
