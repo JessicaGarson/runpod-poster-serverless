@@ -96,7 +96,3 @@ npm run dev
 ```
 
 Open [http://localhost:3000](http://localhost:3000). The controls stay disabled until the app can see both environment variables. The first poster pays the full cold start, so expect a couple of minutes' wait.
-
-## Presenting it live
-
-Start the first poster early if your talk is timed: a cold worker can take a couple of minutes to become ready. Use the warm-up control before presenting if you want the live jobs to begin on already running workers.
